@@ -29,6 +29,19 @@ export async function agentCommand(subArgs, flags) {
       await listAgents(subArgs, flags);
       break;
 
+    case 'list-available':
+    case 'available':
+      await listAvailableAgents(subArgs, flags);
+      break;
+
+    case 'show':
+      await showAgentDefinition(subArgs, flags);
+      break;
+
+    case 'validate':
+      await validateAgentFiles(subArgs, flags);
+      break;
+
     case 'agents':
       await listAgenticFlowAgents(subArgs, flags);
       break;
@@ -944,65 +957,154 @@ function showAgenticMcpHelp() {
 }
 
 async function spawnAgent(subArgs, flags) {
-  const agentType = subArgs[1] || 'general';
+  const agentTypeOrName = subArgs[1] || 'general';
   const agentName = getFlag(subArgs, '--name') || flags.name || `agent-${Date.now()}`;
-  const agentId = `${agentType}-${Date.now()}`;
 
-  // Create the agent object
+  // Import the unified agent registry
+  let unifiedRegistry;
+  try {
+    const module = await import('../../agents/unified-agent-registry.js');
+    unifiedRegistry = module.unifiedAgentRegistry;
+  } catch (err) {
+    // Fallback if module not available
+    unifiedRegistry = null;
+  }
+
+  // Try to find agent definition from registry
+  let agentDefinition = null;
+  let agentType = agentTypeOrName;
+  let capabilities = [];
+  let description = '';
+  let hooks = null;
+  let systemPrompt = null;
+  let isCustomAgent = false;
+  let sourcePath = null;
+  let color = null;
+
+  if (unifiedRegistry) {
+    try {
+      agentDefinition = await unifiedRegistry.getAgent(agentTypeOrName);
+      if (agentDefinition) {
+        agentType = agentDefinition.type || agentTypeOrName;
+        capabilities = agentDefinition.capabilities || [];
+        description = agentDefinition.description || '';
+        isCustomAgent = !agentDefinition.isBuiltIn;
+
+        // Custom agent specific properties
+        if (!agentDefinition.isBuiltIn) {
+          hooks = agentDefinition.hooks || null;
+          systemPrompt = agentDefinition.systemPrompt || null;
+          sourcePath = agentDefinition.sourcePath || null;
+          color = agentDefinition.color || null;
+        }
+      }
+    } catch (err) {
+      // Registry lookup failed, use defaults
+    }
+  }
+
+  // Fall back to hardcoded capabilities if no definition found
+  if (capabilities.length === 0) {
+    capabilities = getAgentCapabilities(agentTypeOrName);
+  }
+
+  const agentId = `${agentTypeOrName}-${Date.now()}`;
+
+  // Create the agent object with full definition
   const agent = {
     id: agentId,
     name: agentName,
     type: agentType,
+    definitionName: agentTypeOrName,
     status: 'active',
     activeTasks: 0,
     lastActivity: Date.now(),
-    capabilities: getAgentCapabilities(agentType),
+    capabilities: capabilities,
+    description: description,
+    isCustomAgent: isCustomAgent,
     createdAt: Date.now()
   };
+
+  // Add custom agent specific fields
+  if (isCustomAgent) {
+    agent.hooks = hooks;
+    agent.systemPrompt = systemPrompt;
+    agent.sourcePath = sourcePath;
+    agent.color = color;
+  }
 
   // Store agent in session/agents directory
   const { promises: fs } = await import('fs');
   const path = await import('path');
-  
-  // Ensure agents directory exists
-  const agentsDir = '.claude-flow/agents';
+
+  // Ensure agents directory exists (use instance directory, not definitions)
+  const agentsDir = '.claude-flow/agent-instances';
   await fs.mkdir(agentsDir, { recursive: true });
-  
+
   // Save agent data
   const agentFile = path.join(agentsDir, `${agentId}.json`);
   await fs.writeFile(agentFile, JSON.stringify(agent, null, 2));
-  
+
   // Update performance metrics
   const perfFile = '.claude-flow/metrics/performance.json';
   try {
-    const perfData = JSON.parse(await fs.readFile(perfFile, 'utf8'));
+    await fs.mkdir('.claude-flow/metrics', { recursive: true });
+    let perfData;
+    try {
+      perfData = JSON.parse(await fs.readFile(perfFile, 'utf8'));
+    } catch {
+      perfData = {
+        startTime: Date.now(),
+        totalTasks: 0,
+        successfulTasks: 0,
+        failedTasks: 0,
+        totalAgents: 0,
+        activeAgents: 0,
+        neuralEvents: 0
+      };
+    }
     perfData.totalAgents = (perfData.totalAgents || 0) + 1;
     perfData.activeAgents = (perfData.activeAgents || 0) + 1;
     await fs.writeFile(perfFile, JSON.stringify(perfData, null, 2));
   } catch (e) {
-    // Create new performance file if doesn't exist
-    await fs.writeFile(perfFile, JSON.stringify({
-      startTime: Date.now(),
-      totalTasks: 0,
-      successfulTasks: 0,
-      failedTasks: 0,
-      totalAgents: 1,
-      activeAgents: 1,
-      neuralEvents: 0
-    }, null, 2));
+    // Metrics update failed, continue anyway
   }
 
-  printSuccess(`✅ Spawned ${agentType} agent: ${agentName}`);
+  // Execute pre-spawn hook if defined
+  if (hooks && hooks.pre) {
+    try {
+      printSuccess('🔄 Running pre-spawn hook...');
+      const hookEnv = { ...process.env, AGENT_NAME: agentName, AGENT_TYPE: agentType };
+      await execAsync(hooks.pre, { env: hookEnv, timeout: 30000 });
+    } catch (hookErr) {
+      printWarning(`⚠️  Pre-spawn hook warning: ${hookErr.message}`);
+    }
+  }
+
+  printSuccess(`✅ Spawned ${agentTypeOrName} agent: ${agentName}`);
   console.log('🤖 Agent successfully created:');
   console.log(`   ID: ${agentId}`);
+  console.log(`   Definition: ${agentTypeOrName}${isCustomAgent ? ' (custom)' : ' (built-in)'}`);
   console.log(`   Type: ${agentType}`);
   console.log(`   Name: ${agentName}`);
-  console.log(`   Capabilities: ${agent.capabilities.join(', ')}`);
+  console.log(`   Capabilities: ${capabilities.join(', ')}`);
+  if (description) {
+    console.log(`   Description: ${description}`);
+  }
+  if (color) {
+    console.log(`   Color: ${color}`);
+  }
   console.log(`   Status: ${agent.status}`);
   console.log(`   Location: ${agentFile}`);
-  
+  if (sourcePath) {
+    console.log(`   Definition: ${sourcePath}`);
+  }
+  if (systemPrompt) {
+    console.log(`   System Prompt: ${systemPrompt.length} characters`);
+  }
+
   // Track agent spawn for performance metrics
-  await onAgentSpawn(agentId, agentType, { name: agentName });
+  await onAgentSpawn(agentId, agentType, { name: agentName, isCustom: isCustomAgent });
 }
 
 function getAgentCapabilities(type) {
@@ -1017,47 +1119,364 @@ function getAgentCapabilities(type) {
   return capabilities[type] || capabilities.general;
 }
 
-async function listAgents(subArgs, flags) {
-  const { promises: fs } = await import('fs');
-  const path = await import('path');
-  
-  const agentsDir = '.claude-flow/agents';
-  const agents = [];
-  
+/**
+ * List all available agent definitions (built-in + custom)
+ */
+async function listAvailableAgents(subArgs, flags) {
+  printSuccess('📋 Loading available agent definitions...');
+
+  let unifiedRegistry;
   try {
-    const agentFiles = await fs.readdir(agentsDir);
-    for (const file of agentFiles) {
-      if (file.endsWith('.json')) {
-        try {
-          const content = await fs.readFile(path.join(agentsDir, file), 'utf8');
-          const agent = JSON.parse(content);
-          agents.push(agent);
-        } catch {
-          // Skip invalid agent files
+    const module = await import('../../agents/unified-agent-registry.js');
+    unifiedRegistry = module.unifiedAgentRegistry;
+  } catch (err) {
+    printError('❌ Failed to load agent registry');
+    console.error(err.message);
+    return;
+  }
+
+  try {
+    const agents = await unifiedRegistry.getAllAgents();
+    const stats = await unifiedRegistry.getStats();
+
+    console.log(`\n📊 Agent Statistics:`);
+    console.log(`   Total: ${stats.totalAgents}`);
+    console.log(`   Built-in: ${stats.builtInCount}`);
+    console.log(`   Custom: ${stats.customCount}`);
+    if (stats.overriddenBuiltIns.length > 0) {
+      console.log(`   Overridden: ${stats.overriddenBuiltIns.join(', ')}`);
+    }
+
+    // Group agents by type
+    const byType = {};
+    const customAgents = [];
+    const builtInAgents = [];
+
+    for (const agent of agents) {
+      const type = agent.type || 'custom';
+      if (!byType[type]) {
+        byType[type] = [];
+      }
+      byType[type].push(agent);
+
+      if (agent.isBuiltIn) {
+        builtInAgents.push(agent);
+      } else {
+        customAgents.push(agent);
+      }
+    }
+
+    // Show custom agents first if any
+    if (customAgents.length > 0) {
+      console.log('\n🌟 Custom Agents (.claude-flow/agents/ & .claude/agents/):');
+      console.log('─'.repeat(60));
+      for (const agent of customAgents) {
+        const color = agent.color ? ` ${agent.color}` : '';
+        const priority = agent.priority ? ` [${agent.priority}]` : '';
+        console.log(`  ${agent.name}${color}${priority}`);
+        console.log(`    Type: ${agent.type || 'custom'}`);
+        console.log(`    Description: ${agent.description || 'No description'}`);
+        if (agent.capabilities && agent.capabilities.length > 0) {
+          console.log(`    Capabilities: ${agent.capabilities.slice(0, 4).join(', ')}${agent.capabilities.length > 4 ? '...' : ''}`);
+        }
+        if (agent.sourcePath) {
+          console.log(`    Source: ${agent.sourcePath}`);
+        }
+        console.log('');
+      }
+    }
+
+    // Show built-in agents
+    if (builtInAgents.length > 0) {
+      console.log('\n🔧 Built-in Agents:');
+      console.log('─'.repeat(60));
+      for (const agent of builtInAgents) {
+        console.log(`  ${agent.name}`);
+        console.log(`    Description: ${agent.description}`);
+        console.log(`    Capabilities: ${agent.capabilities.join(', ')}`);
+        console.log('');
+      }
+    }
+
+    console.log('\n💡 Usage:');
+    console.log('  claude-flow agent spawn <agent-name> --name "MyAgent"');
+    console.log('  claude-flow agent show <agent-name>');
+    console.log('  claude-flow agent validate');
+
+  } catch (err) {
+    printError('❌ Failed to list agents');
+    console.error(err.message);
+  }
+}
+
+/**
+ * Show detailed information about an agent definition
+ */
+async function showAgentDefinition(subArgs, flags) {
+  const agentName = subArgs[1];
+
+  if (!agentName) {
+    printError('Usage: agent show <agent-name>');
+    console.log('\nExamples:');
+    console.log('  claude-flow agent show coder');
+    console.log('  claude-flow agent show my-custom-agent');
+    return;
+  }
+
+  let unifiedRegistry;
+  try {
+    const module = await import('../../agents/unified-agent-registry.js');
+    unifiedRegistry = module.unifiedAgentRegistry;
+  } catch (err) {
+    printError('❌ Failed to load agent registry');
+    console.error(err.message);
+    return;
+  }
+
+  try {
+    const agent = await unifiedRegistry.getAgent(agentName);
+
+    if (!agent) {
+      printError(`❌ Agent not found: ${agentName}`);
+      console.log('\nRun "claude-flow agent list-available" to see all agents');
+      return;
+    }
+
+    printSuccess(`📖 Agent Definition: ${agentName}`);
+    console.log('═'.repeat(60));
+
+    console.log(`\n📋 Basic Information:`);
+    console.log(`   Name: ${agent.name}`);
+    console.log(`   Type: ${agent.type || 'custom'}`);
+    console.log(`   Source: ${agent.isBuiltIn ? 'Built-in' : 'Custom (.md file)'}`);
+
+    if (agent.color) {
+      console.log(`   Color: ${agent.color}`);
+    }
+    if (agent.priority) {
+      console.log(`   Priority: ${agent.priority}`);
+    }
+    if (agent.category) {
+      console.log(`   Category: ${agent.category}`);
+    }
+
+    console.log(`\n📝 Description:`);
+    console.log(`   ${agent.description || 'No description provided'}`);
+
+    console.log(`\n🎯 Capabilities:`);
+    if (agent.capabilities && agent.capabilities.length > 0) {
+      for (const cap of agent.capabilities) {
+        console.log(`   • ${cap}`);
+      }
+    } else {
+      console.log('   No capabilities defined');
+    }
+
+    // Custom agent specific info
+    if (!agent.isBuiltIn) {
+      if (agent.sourcePath) {
+        console.log(`\n📁 Source File:`);
+        console.log(`   ${agent.sourcePath}`);
+      }
+
+      if (agent.hooks) {
+        console.log(`\n🔗 Hooks:`);
+        if (agent.hooks.pre) {
+          console.log(`   Pre-hook: ${agent.hooks.pre.split('\n')[0]}${agent.hooks.pre.includes('\n') ? '...' : ''}`);
+        }
+        if (agent.hooks.post) {
+          console.log(`   Post-hook: ${agent.hooks.post.split('\n')[0]}${agent.hooks.post.includes('\n') ? '...' : ''}`);
+        }
+      }
+
+      if (agent.systemPrompt) {
+        console.log(`\n📜 System Prompt (${agent.systemPrompt.length} chars):`);
+        console.log('─'.repeat(60));
+        // Show first 500 chars of system prompt
+        const preview = agent.systemPrompt.substring(0, 500);
+        console.log(preview);
+        if (agent.systemPrompt.length > 500) {
+          console.log(`\n... (${agent.systemPrompt.length - 500} more characters)`);
         }
       }
     }
-  } catch {
-    // Agents directory doesn't exist yet
+
+    console.log('\n═'.repeat(60));
+    console.log('💡 To spawn this agent:');
+    console.log(`   claude-flow agent spawn ${agentName} --name "MyAgentInstance"`);
+
+  } catch (err) {
+    printError(`❌ Failed to show agent: ${agentName}`);
+    console.error(err.message);
   }
-  
+}
+
+/**
+ * Validate agent definition files
+ */
+async function validateAgentFiles(subArgs, flags) {
+  printSuccess('🔍 Validating agent definition files...');
+
+  let customAgentLoader;
+  try {
+    const module = await import('../../agents/custom-agent-loader.js');
+    customAgentLoader = module.customAgentLoader;
+  } catch (err) {
+    printError('❌ Failed to load agent loader');
+    console.error(err.message);
+    return;
+  }
+
+  try {
+    // Get search directories
+    const searchDirs = customAgentLoader.getSearchDirectories();
+    console.log('\n📁 Search Directories:');
+    if (searchDirs.length === 0) {
+      console.log('   No agent directories found');
+      console.log('\n💡 Create agents in:');
+      console.log('   .claude-flow/agents/<agent-name>.md');
+      console.log('   .claude/agents/<agent-name>.md');
+      return;
+    }
+    for (const dir of searchDirs) {
+      console.log(`   • ${dir}`);
+    }
+
+    // Validate all agent files
+    const results = await customAgentLoader.validateAllAgents();
+
+    if (results.length === 0) {
+      console.log('\n📋 No agent files found to validate');
+      return;
+    }
+
+    let validCount = 0;
+    let invalidCount = 0;
+    let warningCount = 0;
+
+    console.log('\n📋 Validation Results:');
+    console.log('─'.repeat(60));
+
+    for (const result of results) {
+      const fileName = result.filePath.split('/').pop();
+
+      if (result.valid) {
+        validCount++;
+        if (result.warnings.length > 0) {
+          warningCount++;
+          console.log(`⚠️  ${fileName}`);
+          for (const warning of result.warnings) {
+            console.log(`    Warning: ${warning}`);
+          }
+        } else {
+          console.log(`✅ ${fileName}`);
+        }
+        if (result.agent && flags.verbose) {
+          console.log(`    Name: ${result.agent.name}`);
+          console.log(`    Type: ${result.agent.type || 'custom'}`);
+          console.log(`    Capabilities: ${result.agent.capabilities.length}`);
+        }
+      } else {
+        invalidCount++;
+        console.log(`❌ ${fileName}`);
+        for (const error of result.errors) {
+          console.log(`    Error: ${error}`);
+        }
+        for (const warning of result.warnings) {
+          console.log(`    Warning: ${warning}`);
+        }
+      }
+    }
+
+    console.log('\n' + '─'.repeat(60));
+    console.log(`📊 Summary:`);
+    console.log(`   Total files: ${results.length}`);
+    console.log(`   Valid: ${validCount}`);
+    console.log(`   Invalid: ${invalidCount}`);
+    console.log(`   With warnings: ${warningCount}`);
+
+    if (invalidCount > 0) {
+      console.log('\n💡 Agent file format:');
+      console.log('   ---');
+      console.log('   name: my-agent');
+      console.log('   type: coder');
+      console.log('   description: My custom agent');
+      console.log('   capabilities:');
+      console.log('     - skill1');
+      console.log('     - skill2');
+      console.log('   ---');
+      console.log('   # System prompt here...');
+    }
+
+    // Show any load errors
+    const loadErrors = customAgentLoader.getLoadErrors();
+    if (loadErrors.length > 0) {
+      console.log('\n⚠️  Load Errors:');
+      for (const error of loadErrors) {
+        console.log(`   • ${error}`);
+      }
+    }
+
+  } catch (err) {
+    printError('❌ Validation failed');
+    console.error(err.message);
+  }
+}
+
+async function listAgents(subArgs, flags) {
+  const { promises: fs } = await import('fs');
+  const path = await import('path');
+
+  // Check both old and new agent instance directories
+  const agentsDirs = ['.claude-flow/agent-instances', '.claude-flow/agents'];
+  const agents = [];
+
+  for (const agentsDir of agentsDirs) {
+    try {
+      const agentFiles = await fs.readdir(agentsDir);
+      for (const file of agentFiles) {
+        if (file.endsWith('.json')) {
+          try {
+            const content = await fs.readFile(path.join(agentsDir, file), 'utf8');
+            const agent = JSON.parse(content);
+            // Only include agent instances (have id and status fields)
+            if (agent.id && agent.status) {
+              agents.push(agent);
+            }
+          } catch {
+            // Skip invalid agent files
+          }
+        }
+      }
+    } catch {
+      // Directory doesn't exist yet
+    }
+  }
+
   if (agents.length > 0) {
-    printSuccess(`Active agents (${agents.length}):`);
+    printSuccess(`Active agent instances (${agents.length}):`);
     agents.forEach(agent => {
       const statusEmoji = agent.status === 'active' ? '🟢' : '🟡';
-      console.log(`${statusEmoji} ${agent.name} (${agent.type})`);
+      const customBadge = agent.isCustomAgent ? ' [custom]' : '';
+      console.log(`${statusEmoji} ${agent.name} (${agent.definitionName || agent.type})${customBadge}`);
       console.log(`   ID: ${agent.id}`);
+      console.log(`   Type: ${agent.type}`);
       console.log(`   Status: ${agent.status}`);
       console.log(`   Tasks: ${agent.activeTasks}`);
+      if (agent.capabilities && agent.capabilities.length > 0) {
+        console.log(`   Capabilities: ${agent.capabilities.slice(0, 3).join(', ')}${agent.capabilities.length > 3 ? '...' : ''}`);
+      }
       console.log(`   Created: ${new Date(agent.createdAt).toLocaleString()}`);
       console.log('');
     });
   } else {
-    console.log('📋 No agents currently active');
-    console.log('\nTo create agents:');
+    console.log('📋 No agent instances currently active');
+    console.log('\nTo spawn agents:');
     console.log('  claude-flow agent spawn researcher --name "ResearchBot"');
     console.log('  claude-flow agent spawn coder --name "CodeBot"');
-    console.log('  claude-flow agent spawn analyst --name "DataBot"');
+    console.log('  claude-flow agent spawn my-custom-agent --name "CustomBot"');
+    console.log('\nTo see available agent definitions:');
+    console.log('  claude-flow agent list-available');
   }
 }
 
@@ -1218,9 +1637,13 @@ function showAgentHelp() {
   console.log('  booster parse-markdown <file>    Parse markdown edits');
   console.log('  booster benchmark [options]      Run performance tests');
   console.log('  booster help                     Show Agent Booster help');
-  console.log('\n🤖 Internal Agent Management:');
-  console.log('  spawn <type> [--name <name>]     Create internal agent');
-  console.log('  list [--verbose]                 List active internal agents');
+  console.log('\n🌟 Custom Agent Support (NEW):');
+  console.log('  list-available                   Show all agents (built-in + custom)');
+  console.log('  show <agent-name>                Display agent definition details');
+  console.log('  validate                         Check .md files for errors');
+  console.log('\n🤖 Agent Instance Management:');
+  console.log('  spawn <agent> [--name <name>]    Spawn agent (custom or built-in)');
+  console.log('  list [--verbose]                 List active agent instances');
   console.log('  terminate <id>                   Stop specific agent');
   console.log('  hierarchy <create|show>          Manage agent hierarchies');
   console.log('  network <topology|metrics>       Agent network operations');
@@ -1290,7 +1713,12 @@ function showAgentHelp() {
   console.log('  claude-flow agent mcp status --detailed');
   console.log('  claude-flow agent mcp list --server agent-booster');
   console.log('  claude-flow agent mcp logs --follow');
-  console.log('\n  # Internal agent management');
+  console.log('\n  # Custom agent management');
+  console.log('  claude-flow agent list-available              # List all agents');
+  console.log('  claude-flow agent show my-custom-agent        # Show agent details');
+  console.log('  claude-flow agent validate                    # Validate .md files');
+  console.log('  claude-flow agent spawn my-custom-agent --name "CustomBot"');
+  console.log('\n  # Agent instance management');
   console.log('  claude-flow agent spawn researcher --name "DataBot"');
   console.log('  claude-flow agent list --verbose');
   console.log('  claude-flow agent hierarchy create enterprise');
